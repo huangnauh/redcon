@@ -27,12 +27,13 @@ var (
 	EXEC    = "exec"
 	DISCARD = "discard"
 
+	errMultiNested = errors.New("ERROR MULTI calls can not be nested")
+	errEXECErr     = errors.New("ERROR EXEC without MULTI")
+	errDISCARDErr  = errors.New("ERROR DISCARD without MULTI")
+
 	errUnbalancedQuotes       = &errProtocol{"unbalanced quotes in request"}
 	errInvalidBulkLength      = &errProtocol{"invalid bulk length"}
 	errInvalidMultiBulkLength = &errProtocol{"invalid multibulk length"}
-	errMultiNested            = &errProtocol{"MULTI calls can not be nested"}
-	errEXECErr                = &errProtocol{"EXEC without MULTI"}
-	errDISCARDErr             = &errProtocol{"DISCARD without MULTI"}
 	errDetached               = errors.New("detached")
 	errIncompleteCommand      = errors.New("incomplete command")
 	errTooMuchData            = errors.New("too much data")
@@ -411,19 +412,6 @@ func serve(s *Server) error {
 	}
 }
 
-func (c *conn) WriteProtocolError(err *errProtocol) {
-	c.wr.WriteError("ERR " + err.Error())
-	c.wr.Flush()
-}
-
-func (c *conn) checkProtocolErr(err error) {
-	if err, ok := err.(*errProtocol); ok {
-		// All protocol errors should attempt a response to
-		// the client. Ignore write errors.
-		c.WriteProtocolError(err)
-	}
-}
-
 // handle manages the server connection.
 func handle(s *Server, c *conn) {
 	var err error
@@ -455,32 +443,41 @@ func handle(s *Server, c *conn) {
 			}
 			cmds, err := c.rd.readCommands(nil)
 			if err != nil {
-				c.checkProtocolErr(err)
+				if err, ok := err.(*errProtocol); ok {
+					// All protocol errors should attempt a response to
+					// the client. Ignore write errors.
+					c.wr.WriteError("ERR " + err.Error())
+					c.wr.Flush()
+				}
 				return err
 			}
 			c.cmds = cmds
 			for len(c.cmds) > 0 {
 				cmd := c.cmds[0]
+				c.cmds = c.cmds[1:]
 				command := strings.ToLower(string(cmd.Args[0]))
 				if command == EXEC {
 					if !c.multi {
-						c.WriteProtocolError(errEXECErr)
-						return errEXECErr
+						c.wr.WriteError(errEXECErr.Error())
+						continue
 					}
 					s.handler(c, cmd)
-					// clear pendingCmds
+					// clear
+					c.multi = false
 					c.pendingCmds = c.pendingCmds[:0]
 				} else if command == DISCARD {
 					if !c.multi {
-						c.WriteProtocolError(errDISCARDErr)
-						return errDISCARDErr
+						c.wr.WriteError(errDISCARDErr.Error())
+						continue
 					}
 					s.handler(c, cmd)
-
+					// clear
+					c.multi = false
+					c.pendingCmds = c.pendingCmds[:0]
 				} else if c.multi {
 					if command == MULTI {
-						c.WriteProtocolError(errMultiNested)
-						return errMultiNested
+						c.wr.WriteError(errMultiNested.Error())
+						continue
 					}
 					c.pendingCmds = append(c.pendingCmds, cmd)
 					c.WriteString(Queued)
@@ -488,10 +485,11 @@ func handle(s *Server, c *conn) {
 					if c.pendingCmds == nil {
 						c.pendingCmds = make([]Command, 0)
 					}
+					s.handler(c, cmd)
 					c.multi = true
+				} else {
+					s.handler(c, cmd)
 				}
-				c.cmds = c.cmds[1:]
-				s.handler(c, cmd)
 			}
 			if c.detached {
 				// client has been detached
