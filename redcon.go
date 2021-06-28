@@ -3,13 +3,16 @@ package redcon
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tidwall/btree"
@@ -17,13 +20,25 @@ import (
 )
 
 var (
+	OK     = "OK"
+	Queued = "QUEUED"
+
+	MULTI   = "multi"
+	EXEC    = "exec"
+	DISCARD = "discard"
+
 	errUnbalancedQuotes       = &errProtocol{"unbalanced quotes in request"}
 	errInvalidBulkLength      = &errProtocol{"invalid bulk length"}
 	errInvalidMultiBulkLength = &errProtocol{"invalid multibulk length"}
+	errMultiNested            = &errProtocol{"MULTI calls can not be nested"}
+	errEXECErr                = &errProtocol{"EXEC without MULTI"}
+	errDISCARDErr             = &errProtocol{"DISCARD without MULTI"}
 	errDetached               = errors.New("detached")
 	errIncompleteCommand      = errors.New("incomplete command")
 	errTooMuchData            = errors.New("too much data")
 )
+
+const shutdownPollIntervalMax = 500 * time.Millisecond
 
 type errProtocol struct {
 	msg string
@@ -32,6 +47,12 @@ type errProtocol struct {
 func (err *errProtocol) Error() string {
 	return "Protocol error: " + err.msg
 }
+
+type atomicBool int32
+
+func (b *atomicBool) isSet() bool { return atomic.LoadInt32((*int32)(b)) != 0 }
+func (b *atomicBool) setTrue()    { atomic.StoreInt32((*int32)(b), 1) }
+func (b *atomicBool) setFalse()   { atomic.StoreInt32((*int32)(b), 0) }
 
 // Conn represents a client connection
 type Conn interface {
@@ -111,6 +132,11 @@ type Conn interface {
 	PeekPipeline() []Command
 	// NetConn returns the base net.Conn connection
 	NetConn() net.Conn
+	// IsMulti
+	IsMulti() bool
+	PeekPending() []Command
+	Transaction() Transaction
+	SetTransaction(txn Transaction)
 }
 
 // NewServer returns a new Redcon server configured on "tcp" network net.
@@ -184,14 +210,48 @@ func NewServerNetworkTLS(
 
 // Close stops listening on the TCP address.
 // Already Accepted connections will be closed.
-func (s *Server) Close() error {
+func (s *Server) Close(ctx context.Context) error {
+	s.done.setTrue()
+	var err error
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.ln == nil {
+		s.mu.Unlock()
 		return errors.New("not serving")
 	}
-	s.done = true
-	return s.ln.Close()
+	err = s.ln.Close()
+	s.mu.Unlock()
+
+	pollIntervalBase := time.Millisecond
+	nextPollInterval := func() time.Duration {
+		// Add 10% jitter.
+		interval := pollIntervalBase + time.Duration(rand.Intn(int(pollIntervalBase/10)))
+		// Double and clamp for next time.
+		pollIntervalBase *= 2
+		if pollIntervalBase > shutdownPollIntervalMax {
+			pollIntervalBase = shutdownPollIntervalMax
+		}
+		return interval
+	}
+
+	timer := time.NewTimer(nextPollInterval())
+	defer timer.Stop()
+	for {
+		if len(s.conns) == 0 {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			break
+		case <-timer.C:
+			timer.Reset(nextPollInterval())
+		}
+	}
+	s.mu.Lock()
+	for conn := range s.conns {
+		conn.Close()
+	}
+	s.mu.Unlock()
+	return err
 }
 
 // ListenAndServe serves incoming connections.
@@ -206,14 +266,8 @@ func (s *Server) Addr() net.Addr {
 
 // Close stops listening on the TCP address.
 // Already Accepted connections will be closed.
-func (s *TLSServer) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.ln == nil {
-		return errors.New("not serving")
-	}
-	s.done = true
-	return s.ln.Close()
+func (s *TLSServer) Close(ctx context.Context) error {
+	return s.Server.Close(ctx)
 }
 
 // ListenAndServe serves incoming connections.
@@ -325,24 +379,10 @@ func (s *TLSServer) ListenServeAndSignal(signal chan error) error {
 }
 
 func serve(s *Server) error {
-	defer func() {
-		s.ln.Close()
-		func() {
-			s.mu.Lock()
-			defer s.mu.Unlock()
-			for c := range s.conns {
-				c.Close()
-			}
-			s.conns = nil
-		}()
-	}()
 	for {
 		lnconn, err := s.ln.Accept()
 		if err != nil {
-			s.mu.Lock()
-			done := s.done
-			s.mu.Unlock()
-			if done {
+			if s.done.isSet() {
 				return nil
 			}
 			if s.AcceptError != nil {
@@ -368,6 +408,19 @@ func serve(s *Server) error {
 			continue
 		}
 		go handle(s, c)
+	}
+}
+
+func (c *conn) WriteProtocolError(err *errProtocol) {
+	c.wr.WriteError("ERR " + err.Error())
+	c.wr.Flush()
+}
+
+func (c *conn) checkProtocolErr(err error) {
+	if err, ok := err.(*errProtocol); ok {
+		// All protocol errors should attempt a response to
+		// the client. Ignore write errors.
+		c.WriteProtocolError(err)
 	}
 }
 
@@ -398,26 +451,46 @@ func handle(s *Server, c *conn) {
 		for {
 			// read pipeline commands
 			if c.idleClose != 0 {
-				c.conn.SetReadDeadline(time.Now().Add(c.idleClose))
+				_ = c.conn.SetReadDeadline(time.Now().Add(c.idleClose))
 			}
 			cmds, err := c.rd.readCommands(nil)
 			if err != nil {
-				if err, ok := err.(*errProtocol); ok {
-					// All protocol errors should attempt a response to
-					// the client. Ignore write errors.
-					c.wr.WriteError("ERR " + err.Error())
-					c.wr.Flush()
-				}
+				c.checkProtocolErr(err)
 				return err
 			}
 			c.cmds = cmds
 			for len(c.cmds) > 0 {
 				cmd := c.cmds[0]
-				if len(c.cmds) == 1 {
-					c.cmds = nil
-				} else {
-					c.cmds = c.cmds[1:]
+				command := strings.ToLower(string(cmd.Args[0]))
+				if command == EXEC {
+					if !c.multi {
+						c.WriteProtocolError(errEXECErr)
+						return errEXECErr
+					}
+					s.handler(c, cmd)
+					// clear pendingCmds
+					c.pendingCmds = c.pendingCmds[:0]
+				} else if command == DISCARD {
+					if !c.multi {
+						c.WriteProtocolError(errDISCARDErr)
+						return errDISCARDErr
+					}
+					s.handler(c, cmd)
+
+				} else if c.multi {
+					if command == MULTI {
+						c.WriteProtocolError(errMultiNested)
+						return errMultiNested
+					}
+					c.pendingCmds = append(c.pendingCmds, cmd)
+					c.WriteString(Queued)
+				} else if command == MULTI {
+					if c.pendingCmds == nil {
+						c.pendingCmds = make([]Command, 0)
+					}
+					c.multi = true
 				}
+				c.cmds = c.cmds[1:]
 				s.handler(c, cmd)
 			}
 			if c.detached {
@@ -430,21 +503,29 @@ func handle(s *Server, c *conn) {
 			if err := c.wr.Flush(); err != nil {
 				return err
 			}
+			if s.done.isSet() && c.rd.end == c.rd.start {
+				return nil
+			}
 		}
 	}()
 }
 
+type Transaction interface{}
+
 // conn represents a client connection
 type conn struct {
-	conn      net.Conn
-	wr        *Writer
-	rd        *Reader
-	addr      string
-	ctx       interface{}
-	detached  bool
-	closed    bool
-	cmds      []Command
-	idleClose time.Duration
+	conn        net.Conn
+	wr          *Writer
+	rd          *Reader
+	addr        string
+	ctx         interface{}
+	detached    bool
+	closed      bool
+	cmds        []Command
+	idleClose   time.Duration
+	multi       bool
+	pendingCmds []Command
+	txn         Transaction
 }
 
 func (c *conn) Close() error {
@@ -452,21 +533,25 @@ func (c *conn) Close() error {
 	c.closed = true
 	return c.conn.Close()
 }
-func (c *conn) Context() interface{}        { return c.ctx }
-func (c *conn) SetContext(v interface{})    { c.ctx = v }
-func (c *conn) SetReadBuffer(n int)         {}
-func (c *conn) WriteString(str string)      { c.wr.WriteString(str) }
-func (c *conn) WriteBulk(bulk []byte)       { c.wr.WriteBulk(bulk) }
-func (c *conn) WriteBulkString(bulk string) { c.wr.WriteBulkString(bulk) }
-func (c *conn) WriteInt(num int)            { c.wr.WriteInt(num) }
-func (c *conn) WriteInt64(num int64)        { c.wr.WriteInt64(num) }
-func (c *conn) WriteUint64(num uint64)      { c.wr.WriteUint64(num) }
-func (c *conn) WriteError(msg string)       { c.wr.WriteError(msg) }
-func (c *conn) WriteArray(count int)        { c.wr.WriteArray(count) }
-func (c *conn) WriteNull()                  { c.wr.WriteNull() }
-func (c *conn) WriteRaw(data []byte)        { c.wr.WriteRaw(data) }
-func (c *conn) WriteAny(v interface{})      { c.wr.WriteAny(v) }
-func (c *conn) RemoteAddr() string          { return c.addr }
+
+func (c *conn) Transaction() Transaction       { return c.txn }
+func (c *conn) SetTransaction(txn Transaction) { c.txn = txn }
+func (c *conn) IsMulti() bool                  { return c.multi }
+func (c *conn) Context() interface{}           { return c.ctx }
+func (c *conn) SetContext(v interface{})       { c.ctx = v }
+func (c *conn) SetReadBuffer(n int)            {}
+func (c *conn) WriteString(str string)         { c.wr.WriteString(str) }
+func (c *conn) WriteBulk(bulk []byte)          { c.wr.WriteBulk(bulk) }
+func (c *conn) WriteBulkString(bulk string)    { c.wr.WriteBulkString(bulk) }
+func (c *conn) WriteInt(num int)               { c.wr.WriteInt(num) }
+func (c *conn) WriteInt64(num int64)           { c.wr.WriteInt64(num) }
+func (c *conn) WriteUint64(num uint64)         { c.wr.WriteUint64(num) }
+func (c *conn) WriteError(msg string)          { c.wr.WriteError(msg) }
+func (c *conn) WriteArray(count int)           { c.wr.WriteArray(count) }
+func (c *conn) WriteNull()                     { c.wr.WriteNull() }
+func (c *conn) WriteRaw(data []byte)           { c.wr.WriteRaw(data) }
+func (c *conn) WriteAny(v interface{})         { c.wr.WriteAny(v) }
+func (c *conn) RemoteAddr() string             { return c.addr }
 func (c *conn) ReadPipeline() []Command {
 	cmds := c.cmds
 	c.cmds = nil
@@ -475,6 +560,10 @@ func (c *conn) ReadPipeline() []Command {
 func (c *conn) PeekPipeline() []Command {
 	return c.cmds
 }
+func (c *conn) PeekPending() []Command {
+	return c.pendingCmds
+}
+
 func (c *conn) NetConn() net.Conn {
 	return c.conn
 }
@@ -555,7 +644,7 @@ type Server struct {
 	closed    func(conn Conn, err error)
 	conns     map[*conn]bool
 	ln        net.Listener
-	done      bool
+	done      atomicBool
 	idleClose time.Duration
 
 	// AcceptError is an optional function used to handle Accept errors.
