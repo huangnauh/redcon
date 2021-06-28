@@ -27,6 +27,11 @@ var (
 	EXEC    = "exec"
 	DISCARD = "discard"
 
+	IN_SIMPLE  = 0
+	IN_MULTI   = 1
+	IN_EXEC    = 2
+	IN_DISCARD = 3
+
 	errMultiNested = errors.New("ERROR MULTI calls can not be nested")
 	errEXECErr     = errors.New("ERROR EXEC without MULTI")
 	errDISCARDErr  = errors.New("ERROR DISCARD without MULTI")
@@ -63,6 +68,8 @@ type Conn interface {
 	Close() error
 	// WriteError writes an error to the client.
 	WriteError(msg string)
+	// WriterWrongArgs
+	WriterWrongArgs(command string)
 	// WriteString writes a string to the client.
 	WriteString(str string)
 	// WriteBulk writes bulk bytes to the client.
@@ -133,8 +140,8 @@ type Conn interface {
 	PeekPipeline() []Command
 	// NetConn returns the base net.Conn connection
 	NetConn() net.Conn
-	// IsMulti
-	IsMulti() bool
+	//
+	MultiState() int
 	PeekPending() []Command
 	Transaction() Transaction
 	SetTransaction(txn Transaction)
@@ -457,36 +464,50 @@ func handle(s *Server, c *conn) {
 				c.cmds = c.cmds[1:]
 				command := strings.ToLower(string(cmd.Args[0]))
 				if command == EXEC {
-					if !c.multi {
+					if len(cmd.Args) != 1 {
+						c.WriterWrongArgs(command)
+						continue
+					}
+					if c.multi != IN_MULTI {
 						c.wr.WriteError(errEXECErr.Error())
 						continue
 					}
+
+					c.multi = IN_EXEC
 					s.handler(c, cmd)
 					// clear
-					c.multi = false
 					c.pendingCmds = c.pendingCmds[:0]
 				} else if command == DISCARD {
-					if !c.multi {
+					if len(cmd.Args) != 1 {
+						c.WriterWrongArgs(command)
+						continue
+					}
+					if c.multi != IN_MULTI {
 						c.wr.WriteError(errDISCARDErr.Error())
 						continue
 					}
+					c.multi = IN_DISCARD
 					s.handler(c, cmd)
 					// clear
-					c.multi = false
 					c.pendingCmds = c.pendingCmds[:0]
-				} else if c.multi {
+				} else if c.multi == IN_MULTI {
 					if command == MULTI {
 						c.wr.WriteError(errMultiNested.Error())
 						continue
 					}
 					c.pendingCmds = append(c.pendingCmds, cmd)
+					s.handler(c, cmd)
 					c.WriteString(Queued)
 				} else if command == MULTI {
+					if len(cmd.Args) != 1 {
+						c.WriterWrongArgs(command)
+						continue
+					}
 					if c.pendingCmds == nil {
 						c.pendingCmds = make([]Command, 0)
 					}
+					c.multi = IN_MULTI
 					s.handler(c, cmd)
-					c.multi = true
 				} else {
 					s.handler(c, cmd)
 				}
@@ -521,7 +542,7 @@ type conn struct {
 	closed      bool
 	cmds        []Command
 	idleClose   time.Duration
-	multi       bool
+	multi       int
 	pendingCmds []Command
 	txn         Transaction
 }
@@ -531,10 +552,12 @@ func (c *conn) Close() error {
 	c.closed = true
 	return c.conn.Close()
 }
-
+func (c *conn) WriterWrongArgs(command string) {
+	c.WriteError(fmt.Sprintf("ERR wrong number of arguments for '%s' command", command))
+}
 func (c *conn) Transaction() Transaction       { return c.txn }
 func (c *conn) SetTransaction(txn Transaction) { c.txn = txn }
-func (c *conn) IsMulti() bool                  { return c.multi }
+func (c *conn) MultiState() int                { return c.multi }
 func (c *conn) Context() interface{}           { return c.ctx }
 func (c *conn) SetContext(v interface{})       { c.ctx = v }
 func (c *conn) SetReadBuffer(n int)            {}
@@ -558,6 +581,7 @@ func (c *conn) ReadPipeline() []Command {
 func (c *conn) PeekPipeline() []Command {
 	return c.cmds
 }
+
 func (c *conn) PeekPending() []Command {
 	return c.pendingCmds
 }

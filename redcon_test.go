@@ -221,6 +221,7 @@ func TestServerUnix(t *testing.T) {
 }
 
 func testServerNetwork(t *testing.T, network, laddr string) {
+	res := []int{}
 	s := NewServerNetwork(network, laddr,
 		func(conn Conn, cmd Command) {
 			switch strings.ToLower(string(cmd.Args[0])) {
@@ -234,7 +235,11 @@ func testServerNetwork(t *testing.T, network, laddr string) {
 			case "detach":
 				go testDetached(conn.Detach())
 			case "int":
-				conn.WriteInt(100)
+				if conn.MultiState() == IN_MULTI {
+					res = append(res, 100)
+				} else {
+					conn.WriteInt(100)
+				}
 			case "bulk":
 				conn.WriteBulkString("bulk")
 			case "bulkbytes":
@@ -247,6 +252,14 @@ func testServerNetwork(t *testing.T, network, laddr string) {
 				conn.WriteArray(2)
 				conn.WriteInt(99)
 				conn.WriteString("Hi!")
+			case "exec":
+				conn.WriteArray(2)
+				for i := range res {
+					conn.WriteInt(res[i])
+				}
+				res = res[:0]
+			case "multi":
+				conn.WriteString("OK")
 			}
 		},
 		func(conn Conn) bool {
@@ -307,6 +320,39 @@ func testServerNetwork(t *testing.T, network, laddr string) {
 		if res != "+PONG\r\n" {
 			panic(fmt.Sprintf("expecting '+PONG\r\n', got '%v'", res))
 		}
+
+		res, err = do("MULTI\r\n")
+		if err != nil {
+			panic(err)
+		}
+		if res != "+OK\r\n" {
+			panic(fmt.Sprintf("expecting '+OK\r\n', got '%v'", res))
+		}
+
+		res, err = do("INT\r\n")
+		if err != nil {
+			panic(err)
+		}
+		if res != "+QUEUED\r\n" {
+			panic(fmt.Sprintf("expecting '+QUEUED\r\n', got '%v'", res))
+		}
+
+		res, err = do("INT\r\n")
+		if err != nil {
+			panic(err)
+		}
+		if res != "+QUEUED\r\n" {
+			panic(fmt.Sprintf("expecting '+QUEUED\r\n', got '%v'", res))
+		}
+
+		res, err = do("EXEC\r\n")
+		if err != nil {
+			panic(err)
+		}
+		if res != "*2\r\n:100\r\n:100\r\n" {
+			panic(fmt.Sprintf("expecting array, got '%v'", res))
+		}
+
 		res, err = do("BULK\r\n")
 		if err != nil {
 			panic(err)
