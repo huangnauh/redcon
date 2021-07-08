@@ -20,22 +20,6 @@ import (
 )
 
 var (
-	OK     = "OK"
-	Queued = "QUEUED"
-
-	MULTI   = "multi"
-	EXEC    = "exec"
-	DISCARD = "discard"
-
-	IN_SIMPLE  = 0
-	IN_MULTI   = 1
-	IN_EXEC    = 2
-	IN_DISCARD = 3
-
-	errMultiNested = errors.New("ERROR MULTI calls can not be nested")
-	errEXECErr     = errors.New("ERROR EXEC without MULTI")
-	errDISCARDErr  = errors.New("ERROR DISCARD without MULTI")
-
 	errUnbalancedQuotes       = &errProtocol{"unbalanced quotes in request"}
 	errInvalidBulkLength      = &errProtocol{"invalid bulk length"}
 	errInvalidMultiBulkLength = &errProtocol{"invalid multibulk length"}
@@ -68,8 +52,6 @@ type Conn interface {
 	Close() error
 	// WriteError writes an error to the client.
 	WriteError(msg string)
-	// WriterWrongArgs
-	WriterWrongArgs(command string)
 	// WriteString writes a string to the client.
 	WriteString(str string)
 	// WriteBulk writes bulk bytes to the client.
@@ -140,9 +122,7 @@ type Conn interface {
 	PeekPipeline() []Command
 	// NetConn returns the base net.Conn connection
 	NetConn() net.Conn
-	//
-	MultiState() int
-	PeekPending() []Command
+
 	Transaction() Transaction
 	SetTransaction(txn Transaction)
 }
@@ -446,7 +426,7 @@ func handle(s *Server, c *conn) {
 		for {
 			// read pipeline commands
 			if c.idleClose != 0 {
-				_ = c.conn.SetReadDeadline(time.Now().Add(c.idleClose))
+				c.conn.SetReadDeadline(time.Now().Add(c.idleClose))
 			}
 			cmds, err := c.rd.readCommands(nil)
 			if err != nil {
@@ -461,56 +441,12 @@ func handle(s *Server, c *conn) {
 			c.cmds = cmds
 			for len(c.cmds) > 0 {
 				cmd := c.cmds[0]
-				c.cmds = c.cmds[1:]
-				command := strings.ToLower(string(cmd.Args[0]))
-				if command == EXEC {
-					if len(cmd.Args) != 1 {
-						c.WriterWrongArgs(command)
-						continue
-					}
-					if c.multi != IN_MULTI {
-						c.wr.WriteError(errEXECErr.Error())
-						continue
-					}
-
-					c.multi = IN_EXEC
-					s.handler(c, cmd)
-					// clear
-					c.pendingCmds = c.pendingCmds[:0]
-				} else if command == DISCARD {
-					if len(cmd.Args) != 1 {
-						c.WriterWrongArgs(command)
-						continue
-					}
-					if c.multi != IN_MULTI {
-						c.wr.WriteError(errDISCARDErr.Error())
-						continue
-					}
-					c.multi = IN_DISCARD
-					s.handler(c, cmd)
-					// clear
-					c.pendingCmds = c.pendingCmds[:0]
-				} else if c.multi == IN_MULTI {
-					if command == MULTI {
-						c.wr.WriteError(errMultiNested.Error())
-						continue
-					}
-					c.pendingCmds = append(c.pendingCmds, cmd)
-					s.handler(c, cmd)
-					c.WriteString(Queued)
-				} else if command == MULTI {
-					if len(cmd.Args) != 1 {
-						c.WriterWrongArgs(command)
-						continue
-					}
-					if c.pendingCmds == nil {
-						c.pendingCmds = make([]Command, 0)
-					}
-					c.multi = IN_MULTI
-					s.handler(c, cmd)
+				if len(c.cmds) == 1 {
+					c.cmds = nil
 				} else {
-					s.handler(c, cmd)
+					c.cmds = c.cmds[1:]
 				}
+				s.handler(c, cmd)
 			}
 			if c.detached {
 				// client has been detached
@@ -533,18 +469,16 @@ type Transaction interface{}
 
 // conn represents a client connection
 type conn struct {
-	conn        net.Conn
-	wr          *Writer
-	rd          *Reader
-	addr        string
-	ctx         interface{}
-	detached    bool
-	closed      bool
-	cmds        []Command
-	idleClose   time.Duration
-	multi       int
-	pendingCmds []Command
-	txn         Transaction
+	conn      net.Conn
+	wr        *Writer
+	rd        *Reader
+	addr      string
+	ctx       interface{}
+	detached  bool
+	closed    bool
+	cmds      []Command
+	idleClose time.Duration
+	txn       Transaction
 }
 
 func (c *conn) Close() error {
@@ -552,12 +486,9 @@ func (c *conn) Close() error {
 	c.closed = true
 	return c.conn.Close()
 }
-func (c *conn) WriterWrongArgs(command string) {
-	c.WriteError(fmt.Sprintf("ERR wrong number of arguments for '%s' command", command))
-}
+
 func (c *conn) Transaction() Transaction       { return c.txn }
 func (c *conn) SetTransaction(txn Transaction) { c.txn = txn }
-func (c *conn) MultiState() int                { return c.multi }
 func (c *conn) Context() interface{}           { return c.ctx }
 func (c *conn) SetContext(v interface{})       { c.ctx = v }
 func (c *conn) SetReadBuffer(n int)            {}
@@ -581,11 +512,6 @@ func (c *conn) ReadPipeline() []Command {
 func (c *conn) PeekPipeline() []Command {
 	return c.cmds
 }
-
-func (c *conn) PeekPending() []Command {
-	return c.pendingCmds
-}
-
 func (c *conn) NetConn() net.Conn {
 	return c.conn
 }
